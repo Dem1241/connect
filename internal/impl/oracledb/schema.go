@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 
@@ -134,7 +135,7 @@ func isNumberType(dataType string) bool {
 type schemaCache struct {
 	mu         sync.Mutex
 	schemas    map[string]*cachedSchema
-	seededMeta map[string][]replication.ColumnMeta // track the ColumnMeta slice for reuse
+	seededMeta map[string][]replication.ColumnMeta // last ColumnMeta each table was seeded with
 	db         *sql.DB
 	pdbName    string // non-empty in CDB mode; triggers ALTER SESSION SET CONTAINER per refresh
 	log        *service.Logger
@@ -294,14 +295,16 @@ func (sc *schemaCache) schemaForEvent(ctx context.Context, table replication.Use
 }
 
 // seedFromColumnMeta populates the cache from column metadata collected during
-// a snapshot transaction, overriding any pre-fetched entry — unless meta is
-// the same slice (by identity) already used to seed this table, in which case
-// the rebuild is skipped and the cache is left untouched.
+// a snapshot transaction, overriding any pre-fetched entry — unless meta has
+// the same content as the meta last used to seed this table, in which case
+// the rebuild is skipped and the cache is left untouched. It's called for
+// every snapshot row, and parallel snapshot chunks each build their own meta
+// slice per page, so skipping must not depend on slice identity.
 //
-// The identity check is against the last slice this function was called
-// with, not against whatever is currently cached. If schemaForEvent's
-// catalog-refresh path replaces the cached schema in between, a later call
-// here with the same meta slice will not restore the snapshot-derived one.
+// The check is against the last meta this function was called with, not
+// against whatever is currently cached. If schemaForEvent's catalog-refresh
+// path replaces the cached schema in between, a later call here with the same
+// columns will not restore the snapshot-derived one.
 func (sc *schemaCache) seedFromColumnMeta(table replication.UserTable, meta []replication.ColumnMeta) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -332,15 +335,16 @@ func (sc *schemaCache) seedFromColumnMeta(table replication.UserTable, meta []re
 	sc.schemas[tableKey] = &cachedSchema{schema: c.ToAny(), keys: keySet, colTypes: colTypes}
 }
 
-// sameColumnMeta checks whether a and b are the same underlying slice to enable reuse.
+// sameColumnMeta reports whether a and b describe the same columns. Comparing the
+// first element's address first makes the common same-slice case O(1).
 func sameColumnMeta(a, b []replication.ColumnMeta) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	if len(a) == 0 {
+	if len(a) == 0 || &a[0] == &b[0] {
 		return true
 	}
-	return &a[0] == &b[0]
+	return slices.Equal(a, b)
 }
 
 // ---------------------------------------------------------------------------
